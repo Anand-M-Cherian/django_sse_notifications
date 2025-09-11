@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>SSE Demo — step 1</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; padding: 20px; }
+    #messages { margin-top: 16px; max-width: 700px; }
+    .msg { padding: 8px; border: 1px solid #ddd; margin-bottom: 8px; border-radius: 6px; }
+    .meta { color: #666; font-size: 12px; }
+    button { padding: 8px 12px; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <h1>SSE Notifications — Demo (Step 1)</h1>
+
+  <button id="start-btn">Start Listening</button>
+  <button id="stop-btn" disabled>Stop</button>
+
+  <div id="messages"></div>
+
+  <script>
+    let es = null;
+    const messages = document.getElementById('messages');
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+
+    function addMessage(text) {
+      const div = document.createElement('div');
+      div.className = 'msg';
+      div.innerHTML = text;
+      messages.prepend(div);
+    }
+
+    startBtn.addEventListener('click', () => {
+    if (es) {
+        addMessage('<i>Already connected</i>');
+        return;
+    }
+
+    // Create EventSource connection to the Django SSE endpoint
+    es = new EventSource('/notifications/stream/');
+
+    es.onmessage = (e) => {
+        // e.data is the JSON string sent by server
+        const data = JSON.parse(e.data);
+        addMessage(`<b>${data.message}</b><div class="meta">at ${new Date(data.timestamp * 1000).toLocaleTimeString()}</div>`);
+    };
+
+    es.onerror = (e) => {
+        console.error('SSE error', e);
+        addMessage('<span style="color:red;">Connection lost. Retrying...</span>');
+    };
+
+    addMessage('<i>Connected to /notifications/stream/</i>');
+    startBtn.disabled = true;
+    stopBtn.disabled = false;
+    });
+
+    stopBtn.addEventListener('click', () => {
+    if (es) {
+        es.close();  // close the EventSource connection
+        es = null;
+        addMessage('<i>Disconnected</i>');
+    } else {
+        addMessage('<i>No active connection</i>');
+    }
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    });
+
+  </script>
+</body>
+</html>
