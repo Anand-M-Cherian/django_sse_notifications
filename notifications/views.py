@@ -1,88 +1,167 @@
+# notifications/views.py
 import json
 import time
-from collections import deque
-from django.http import StreamingHttpResponse, HttpResponse, JsonResponse
+from django.http import StreamingHttpResponse, JsonResponse, HttpResponse
+from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.encoding import force_str
-from django.shortcuts import render
+from django.conf import settings
+from django.contrib.auth import get_user_model
 
-# Create your views here.
+User = get_user_model()
 
-# Process-local queue for demo only
-_event_queue = deque()
-
-def demo_page(request):
-    return render(request, "notifications/index.html")
+from .models import Notification
+from .utils import create_and_publish, _redis_client as redis_client
 
 def _sse_format(data: str, event_id: str | None = None) -> str:
-    """
-    Format a string as an SSE event.
-    Uses the required "data: " lines and blank line at the end.
-    Optionally include an id: line (for Last-Event-ID handling later).
-    """
+    """Format a string as an SSE event block (id: ... \n data: ... \n\n)."""
     s = ""
     if event_id is not None:
         s += f"id: {event_id}\n"
-    # Each line of data must be prefixed with "data: "
     for line in force_str(data).splitlines():
         s += f"data: {line}\n"
     s += "\n"
     return s
 
+def demo_page(request):
+    """Render the demo HTML page (index.html)"""
+    return render(request, "notifications/index.html")
+
+
 def stream(request):
     """
-    SSE streaming endpoint using StreamingHttpResponse.
-    WARNING: This is demo/demo-only: under WSGI each open connection occupies a worker.
+    SSE stream view (sync).
+    Behavior:
+      1) Determine user_id (optional) and last_event_id from request.
+      2) Replay persisted notifications from Postgres with id > last_event_id.
+      3) Subscribe to Redis channel and forward new messages as SSE events (including id:).
+      4) Do a small post-subscribe DB check to reduce the race window.
+    Note: This is a synchronous implementation suitable for local/dev testing.
     """
+    # Optional: in a later step require authentication here (request.user)
+    user_id = request.GET.get("user_id")
+    last_event_id = request.META.get("HTTP_LAST_EVENT_ID") or request.GET.get("last_id")
+    try:
+        last_event_id = int(last_event_id) if last_event_id else 0
+    except (TypeError, ValueError):
+        last_event_id = 0
 
-    # OPTIONAL: basic auth check could go here (session or token).
-    # if not request.user.is_authenticated:
-    #     return HttpResponse(status=401)
+    channel = f"notifications:user:{user_id}" if user_id else "notifications:global"
 
     def event_stream():
-        # We will poll the in-memory queue. If empty, send a comment heartbeat to keep connection alive.
+        last_sent = last_event_id or 0
+
+        # 1) Replay: send persisted notifications with id > last_sent
+        if last_sent:
+            if user_id:
+                missed_qs = Notification.objects.filter(user_id=user_id, id__gt=last_sent).order_by("id")
+            else:
+                missed_qs = Notification.objects.filter(user__isnull=True, id__gt=last_sent).order_by("id")
+            for n in missed_qs:
+                payload = json.dumps({
+                    "id": n.id,
+                    "user_id": n.user_id,
+                    "payload": n.payload,
+                    "created_at": n.created_at.isoformat(),
+                }, separators=(",", ":"))
+                yield _sse_format(payload, event_id=str(n.id))
+                last_sent = max(last_sent, n.id)
+
+        # 2) Subscribe to Redis for live messages
+        pubsub = redis_client.pubsub(ignore_subscribe_messages=True)
+        pubsub.subscribe(channel)
+
+        # 3) Race mitigation: check DB again for any rows written while subscribing
+        if last_sent:
+            if user_id:
+                pending = Notification.objects.filter(user_id=user_id, id__gt=last_sent).order_by("id")
+            else:
+                pending = Notification.objects.filter(user__isnull=True, id__gt=last_sent).order_by("id")
+            for n in pending:
+                payload = json.dumps({
+                    "id": n.id,
+                    "user_id": n.user_id,
+                    "payload": n.payload,
+                    "created_at": n.created_at.isoformat(),
+                }, separators=(",", ":"))
+                yield _sse_format(payload, event_id=str(n.id))
+                last_sent = max(last_sent, n.id)
+
+        # 4) Listen to Redis and forward messages
         try:
-            while True:
-                if _event_queue:
-                    item = _event_queue.popleft()
-                    payload = json.dumps(item)
-                    yield _sse_format(payload)
-                else:
-                    # comment line (":") is ignored by EventSource clients; used to keep connection alive
-                    yield ": keep-alive\n\n"
-                    # small sleep to avoid busy loop. Tweak for latency/CPU tradeoff.
-                    time.sleep(1)
+            for item in pubsub.listen():
+                if not item:
+                    continue
+                if item.get("type") != "message":
+                    continue
+                raw = item.get("data")
+                if isinstance(raw, bytes):
+                    try:
+                        raw = raw.decode("utf-8")
+                    except Exception:
+                        continue
+                try:
+                    msg = json.loads(raw)
+                except Exception:
+                    # if not JSON, wrap raw payload
+                    msg = {"payload": raw}
+
+                msg_id = msg.get("id")
+                # avoid sending duplicates
+                if msg_id and last_sent and int(msg_id) <= int(last_sent):
+                    continue
+
+                payload_text = json.dumps(msg, separators=(",", ":"))
+                yield _sse_format(payload_text, event_id=str(msg.get("id")) if msg.get("id") else None)
+                if msg.get("id"):
+                    last_sent = max(last_sent, int(msg.get("id")))
         except GeneratorExit:
-            # client disconnected, generator closed
+            # client disconnected; clean up pubsub
+            try:
+                pubsub.close()
+            except Exception:
+                pass
             return
+        finally:
+            try:
+                pubsub.close()
+            except Exception:
+                pass
 
     return StreamingHttpResponse(event_stream(), content_type="text/event-stream")
 
 
-@csrf_exempt  # demo only; in prod protect this endpoint
+@csrf_exempt
 def push(request):
     """
-    Accepts POST JSON and enqueues it for SSE clients.
-    Example:
-      curl -X POST -H "Content-Type: application/json" -d '{"message":"Hello"}' http://127.0.0.1:8000/notifications/push/
+    Persist + publish endpoint.
+    Accepts JSON body like:
+    { "message": "...", "meta": {...}, "user_id": <optional> }
     """
     if request.method != "POST":
         return HttpResponse(status=405)
 
     try:
         body = request.body.decode("utf-8")
-        if not body:
-            return JsonResponse({"error": "empty body"}, status=400)
-        data = json.loads(body)
+        data = json.loads(body) if body else {}
     except Exception:
         return JsonResponse({"error": "invalid json"}, status=400)
 
-    # Build event object — add server timestamp & optional metadata
-    event = {
-        "message": data.get("message", ""),
-        "meta": data.get("meta", {}),
-        "timestamp": time.time(),
-    }
-    _event_queue.append(event)
+    payload = {"message": data.get("message"), "meta": data.get("meta", {})}
+    user_id = data.get("user_id")
 
-    return JsonResponse({"ok": True, "queued": len(_event_queue)})
+    # check if its a valid user
+    if user_id is not None:
+        try:
+            user_id = int(user_id)
+            User.objects.get(pk=user_id)
+        except (ValueError, User.DoesNotExist):
+            return JsonResponse(
+                {"error": "user not found"},
+                status=400
+            )
+
+    # Persist to DB and publish to Redis (create_and_publish returns Notification instance)
+    n = create_and_publish(user_id, payload)
+
+    return JsonResponse({"ok": True, "id": n.id})

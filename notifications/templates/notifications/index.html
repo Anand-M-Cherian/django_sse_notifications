@@ -2,73 +2,122 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>SSE Demo — step 1</title>
+  <title>SSE Notifications — Clean</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
   <style>
-    body { font-family: system-ui, -apple-system, Roboto, Arial; padding: 20px; }
-    #messages { margin-top: 16px; max-width: 700px; }
-    .msg { padding: 8px; border: 1px solid #ddd; margin-bottom: 8px; border-radius: 6px; }
+    body { font-family: system-ui, -apple-system, Roboto, Arial; padding: 20px; color: #111; }
+    h1 { margin: 0 0 8px 0; font-size: 20px; }
+    p { margin: 0 0 16px 0; color: #444; }
+    .controls { margin-bottom: 12px; }
+    button { padding: 8px 12px; margin-right: 8px; border-radius: 6px; border: 1px solid #ddd; background: #f7f7f8; cursor: pointer; }
+    button:disabled { opacity: 0.5; cursor: default; }
+    #messages { margin-top: 16px; max-width: 820px; }
+    .msg { padding: 10px 12px; border: 1px solid #eee; margin-bottom: 10px; border-radius: 8px; background: #fff; box-shadow: 0 1px 0 rgba(0,0,0,0.02); }
+    .msg .text { font-size: 15px; margin-bottom: 6px; }
     .meta { color: #666; font-size: 12px; }
-    button { padding: 8px 12px; font-size: 14px; }
+    .small { font-size: 12px; color: #666; }
   </style>
 </head>
 <body>
-  <h1>SSE Notifications — Demo (Step 1)</h1>
+  <h1>SSE Notifications — Clean</h1>
+  <p class="small">This page listens to server-sent events (SSE). It expects events in the DB+Redis format.</p>
 
-  <button id="start-btn">Start Listening</button>
-  <button id="stop-btn" disabled>Stop</button>
+  <div class="controls">
+    <button id="start-btn">Start Listening</button>
+    <button id="stop-btn" disabled>Stop</button>
+    <label style="margin-left:12px;" class="small">User ID (optional): <input id="user-id" style="width:60px" /></label>
+  </div>
 
   <div id="messages"></div>
 
   <script>
-    let es = null;
-    const messages = document.getElementById('messages');
-    const startBtn = document.getElementById('start-btn');
-    const stopBtn = document.getElementById('stop-btn');
+    // --- Helpers -----------------------------------------------------------------
+    function escapeHtml(str) {
+      return String(str)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
 
-    function addMessage(text) {
+    function addMessageHtml(html) {
+      const messages = document.getElementById('messages');
       const div = document.createElement('div');
       div.className = 'msg';
-      div.innerHTML = text;
+      div.innerHTML = html;
       messages.prepend(div);
     }
 
-    startBtn.addEventListener('click', () => {
-    if (es) {
-        addMessage('<i>Already connected</i>');
-        return;
+    // --- SSE connection logic ---------------------------------------------------
+    let es = null;
+    const startBtn = document.getElementById('start-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    const userIdInput = document.getElementById('user-id');
+
+    function connect(userId) {
+      const url = userId ? `/notifications/stream/?user_id=${encodeURIComponent(userId)}` : '/notifications/stream/';
+      es = new EventSource(url);
+
+      es.onopen = () => {
+        addMessageHtml('<div class="text"><em>Connected to stream</em></div><div class="meta">URL: ' + escapeHtml(url) + '</div>');
+      };
+
+      es.onmessage = (e) => {
+        // Server sends events with this shape:
+        // { "id": 42, "user_id": null, "payload": { "message": "...", "meta": {...} }, "created_at": "ISO-8601" }
+        let parsed;
+        try {
+          parsed = JSON.parse(e.data);
+        } catch (err) {
+          console.error('SSE: invalid JSON', e.data, err);
+          addMessageHtml('<div class="text"><em>Received non-JSON message</em></div><div class="meta">' + escapeHtml(String(e.data)) + '</div>');
+          return;
+        }
+
+        const msgText = parsed.payload && parsed.payload.message ? parsed.payload.message : '(no message)';
+        const metaObj = parsed.payload && parsed.payload.meta ? parsed.payload.meta : null;
+        const createdAt = parsed.created_at ? new Date(parsed.created_at) : new Date();
+        const timeText = isNaN(createdAt.getTime()) ? 'Unknown time' : createdAt.toLocaleString();
+
+        const metaHtml = metaObj ? `<div class="meta">meta: ${escapeHtml(JSON.stringify(metaObj))}</div>` : '';
+        const html = `<div class="text">${escapeHtml(msgText)}</div>${metaHtml}<div class="meta">id: ${escapeHtml(String(parsed.id || ''))} — at ${escapeHtml(timeText)}</div>`;
+        addMessageHtml(html);
+      };
+
+      es.onerror = (err) => {
+        console.warn('SSE error', err);
+        // EventSource auto-reconnects; show a notice
+        addMessageHtml('<div class="text"><em>Connection error — EventSource will reconnect automatically.</em></div>');
+      };
     }
 
-    // Create EventSource connection to the Django SSE endpoint
-    es = new EventSource('/notifications/stream/');
+    function disconnect() {
+      if (es) {
+        try { es.close(); } catch (e) { /* ignore */ }
+        es = null;
+      }
+    }
 
-    es.onmessage = (e) => {
-        // e.data is the JSON string sent by server
-        const data = JSON.parse(e.data);
-        addMessage(`<b>${data.message}</b><div class="meta">at ${new Date(data.timestamp * 1000).toLocaleTimeString()}</div>`);
-    };
-
-    es.onerror = (e) => {
-        console.error('SSE error', e);
-        addMessage('<span style="color:red;">Connection lost. Retrying...</span>');
-    };
-
-    addMessage('<i>Connected to /notifications/stream/</i>');
-    startBtn.disabled = true;
-    stopBtn.disabled = false;
+    // --- UI wiring --------------------------------------------------------------
+    startBtn.addEventListener('click', () => {
+      if (es) { addMessageHtml('<div class="text"><em>Already connected</em></div>'); return; }
+      const userId = userIdInput.value.trim() || null;
+      connect(userId);
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
     });
 
     stopBtn.addEventListener('click', () => {
-    if (es) {
-        es.close();  // close the EventSource connection
-        es = null;
-        addMessage('<i>Disconnected</i>');
-    } else {
-        addMessage('<i>No active connection</i>');
-    }
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
+      if (!es) { addMessageHtml('<div class="text"><em>No active connection</em></div>'); return; }
+      disconnect();
+      addMessageHtml('<div class="text"><em>Disconnected</em></div>');
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
     });
 
+    // Optional: auto-connect during development (comment out if not desired)
+    // window.addEventListener('load', () => { /* startBtn.click(); */ });
   </script>
 </body>
 </html>
