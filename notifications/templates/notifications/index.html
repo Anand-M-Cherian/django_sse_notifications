@@ -26,6 +26,7 @@
     <button id="start-btn">Start Listening</button>
     <button id="stop-btn" disabled>Stop</button>
     <label style="margin-left:12px;" class="small">User ID (optional): <input id="user-id" style="width:60px" /></label>
+    <label style="margin-left:12px;" class="small">Last Event ID (optional): <input id="last-id" style="width:80px" /></label>
   </div>
 
   <div id="messages"></div>
@@ -54,9 +55,14 @@
     const startBtn = document.getElementById('start-btn');
     const stopBtn = document.getElementById('stop-btn');
     const userIdInput = document.getElementById('user-id');
+    const lastIdInput = document.getElementById('last-id');
 
-    function connect(userId) {
-      const url = userId ? `/notifications/stream/?user_id=${encodeURIComponent(userId)}` : '/notifications/stream/';
+    function connect(userId, lastId) {
+      let url = '/notifications/stream/';
+      const params = [];
+      if (userId) params.push(`user_id=${encodeURIComponent(userId)}`);
+      if (lastId) params.push(`last_id=${encodeURIComponent(lastId)}`);
+      if (params.length) url += '?' + params.join('&');
       es = new EventSource(url);
 
       es.onopen = () => {
@@ -103,7 +109,8 @@
     startBtn.addEventListener('click', () => {
       if (es) { addMessageHtml('<div class="text"><em>Already connected</em></div>'); return; }
       const userId = userIdInput.value.trim() || null;
-      connect(userId);
+      const lastId = lastIdInput.value.trim() || null;
+      connect(userId, lastId);
       startBtn.disabled = true;
       stopBtn.disabled = false;
     });

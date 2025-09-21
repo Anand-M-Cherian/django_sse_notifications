@@ -7,6 +7,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.utils.encoding import force_str
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from oauth2_provider.decorators import protected_resource
 
 User = get_user_model()
 
@@ -132,6 +133,7 @@ def stream(request):
 
 
 @csrf_exempt
+@protected_resource()
 def push(request):
     """
     Persist + publish endpoint.
